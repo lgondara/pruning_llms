@@ -70,6 +70,38 @@ class TransformerPruner:
         self.pruning_factors: Dict[str, float] = {}
         
         print(f"Found {len(self.linear_layers)} linear layers to potentially prune")
+        
+        if len(self.linear_layers) == 0:
+            print("\n⚠️  WARNING: No layers found to prune!")
+            print("\nDebugging info:")
+            print(f"  - prune_attention: {self.config.prune_attention}")
+            print(f"  - prune_ffn: {self.config.prune_ffn}")
+            print(f"  - prune_embeddings: {self.config.prune_embeddings}")
+            print("\nLet me check what linear layers exist in your model...")
+            
+            all_linear = []
+            for name, module in self.model.named_modules():
+                if isinstance(module, nn.Linear):
+                    all_linear.append((name, module.in_features, module.out_features))
+            
+            if len(all_linear) > 0:
+                print(f"\nFound {len(all_linear)} total linear layers:")
+                for i, (name, in_f, out_f) in enumerate(all_linear[:10]):
+                    print(f"  {name}: {in_f} -> {out_f}")
+                if len(all_linear) > 10:
+                    print(f"  ... and {len(all_linear) - 10} more")
+                
+                print("\n💡 Tip: Try setting prune_attention=True and prune_ffn=True")
+                print("Or report this layer naming pattern as an issue!")
+            else:
+                print("\nNo linear layers found in the model at all. Is this the right model?")
+        else:
+            # Show sample of what we found
+            print("\nSample of layers to prune:")
+            for i, (name, module) in enumerate(list(self.linear_layers.items())[:5]):
+                print(f"  {name}: {module.in_features} -> {module.out_features}")
+            if len(self.linear_layers) > 5:
+                print(f"  ... and {len(self.linear_layers) - 5} more")
     
     def _extract_linear_layers(self) -> Dict[str, nn.Linear]:
         """
@@ -83,30 +115,38 @@ class TransformerPruner:
             if not isinstance(module, nn.Linear):
                 continue
             
+            name_lower = name.lower()
+            
+            # Skip these layers first (embeddings, norms, heads)
+            skip_patterns = []
+            if not self.config.prune_embeddings:
+                skip_patterns.extend(['embed', 'wte', 'wpe', 'position', 'token'])
+            # Always skip normalization and output heads
+            skip_patterns.extend(['ln', 'layernorm', 'norm', 'lm_head', 'score'])
+            
+            if any(pattern in name_lower for pattern in skip_patterns):
+                continue
+            
             # Determine if this layer should be pruned
             should_prune = False
             
-            # Attention layers
+            # Attention layers - expanded patterns for different model architectures
             if self.config.prune_attention:
-                if any(x in name.lower() for x in ['q_proj', 'k_proj', 'v_proj', 
-                                                     'qkv', 'o_proj', 'out_proj',
-                                                     'attention']):
+                # Check if this is in an attention block
+                in_attention_block = any(block in name_lower for block in ['.attn.', '.attention.', '.self_attn.'])
+                
+                if in_attention_block:
+                    # If in attention block, all linear layers can be pruned
                     should_prune = True
             
-            # FFN layers
-            if self.config.prune_ffn:
-                if any(x in name.lower() for x in ['mlp', 'fc1', 'fc2', 'ffn',
-                                                     'gate_proj', 'up_proj', 'down_proj']):
+            # FFN/MLP layers - expanded patterns
+            if self.config.prune_ffn and not should_prune:  # Don't double-count
+                # Check if this is in an MLP/FFN block
+                in_mlp_block = any(block in name_lower for block in ['.mlp.', '.ffn.', '.feed_forward.'])
+                
+                if in_mlp_block:
+                    # If in MLP block, all linear layers can be pruned
                     should_prune = True
-            
-            # Skip embeddings unless explicitly enabled
-            if not self.config.prune_embeddings:
-                if any(x in name.lower() for x in ['embed', 'wte', 'wpe']):
-                    should_prune = False
-            
-            # Skip layer norm and final output layers
-            if any(x in name.lower() for x in ['ln', 'norm', 'lm_head']):
-                should_prune = False
             
             if should_prune:
                 linear_layers[name] = module
@@ -130,15 +170,43 @@ class TransformerPruner:
         out_dim = module.out_features
         in_dim = module.in_features
         
-        # Common patterns
-        if any(x in name.lower() for x in ['o_proj', 'out_proj', 'down_proj', 'fc2']):
-            return "down"
-        elif any(x in name.lower() for x in ['q_proj', 'k_proj', 'v_proj', 
-                                               'qkv', 'up_proj', 'gate_proj', 'fc1']):
-            return "up"
+        name_lower = name.lower()
+        
+        # Down projection patterns
+        down_patterns = [
+            'o_proj', 'out_proj', 'c_proj',  # Attention output
+            'down_proj', 'fc2', 'wo',         # FFN down
+            'dense.output', 'output.dense'     # BERT style
+        ]
+        
+        # Up projection patterns  
+        up_patterns = [
+            'q_proj', 'k_proj', 'v_proj',     # Q/K/V projections
+            'c_attn',                          # GPT-2 combined QKV
+            'up_proj', 'gate_proj', 'fc1',    # FFN up
+            'c_fc',                            # GPT-2 FFN
+            'wi', 'intermediate.dense'         # T5/BERT style
+        ]
+        
+        # Check patterns first
+        for pattern in down_patterns:
+            if pattern in name_lower:
+                return "down"
+        
+        for pattern in up_patterns:
+            if pattern in name_lower:
+                return "up"
+        
+        # If in FFN/MLP, make educated guess based on typical structure
+        if any(x in name_lower for x in ['mlp', 'ffn']):
+            # First layer is usually up, second is down
+            if any(x in name_lower for x in ['0', 'first', 'wi']):
+                return "up"
+            elif any(x in name_lower for x in ['1', 'second', 'wo']):
+                return "down"
         
         # Default based on dimensions
-        return "up" if out_dim > in_dim else "down"
+        return "up" if out_dim >= in_dim else "down"
     
     def collect_activations(self,
                            calibration_data: List[Dict],
