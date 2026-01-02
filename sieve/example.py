@@ -52,27 +52,73 @@ def parse_args():
                        help="Only run model diagnostics")
     parser.add_argument("--device", type=str, default=None,
                        help="Device (cuda/cpu)")
+    
+    # Quantization options
+    parser.add_argument("--load-in-4bit", action="store_true",
+                       help="Load model in 4-bit quantization (requires bitsandbytes)")
+    parser.add_argument("--load-in-8bit", action="store_true",
+                       help="Load model in 8-bit quantization (requires bitsandbytes)")
+    
     return parser.parse_args()
 
 
-def load_model_and_tokenizer(model_name: str, device: str):
-    """Load model and tokenizer from HuggingFace."""
+def load_model_and_tokenizer(model_name: str, device: str, load_in_4bit: bool = False, load_in_8bit: bool = False):
+    """Load model and tokenizer from HuggingFace.
+    
+    Args:
+        model_name: HuggingFace model name
+        device: Device to load on (ignored if quantizing)
+        load_in_4bit: Load in 4-bit quantization (requires bitsandbytes)
+        load_in_8bit: Load in 8-bit quantization (requires bitsandbytes)
+    """
     print(f"\nLoading model: {model_name}")
     
     tokenizer = AutoTokenizer.from_pretrained(model_name)
     if tokenizer.pad_token is None:
         tokenizer.pad_token = tokenizer.eos_token
     
-    model = AutoModelForCausalLM.from_pretrained(
-        model_name,
-        torch_dtype=torch.float32,  # Use float32 for pruning stability
-    ).to(device)
+    # Configure quantization if requested
+    load_kwargs = {}
+    
+    if load_in_4bit:
+        print("  Loading in 4-bit quantization...")
+        try:
+            from transformers import BitsAndBytesConfig
+            load_kwargs['quantization_config'] = BitsAndBytesConfig(
+                load_in_4bit=True,
+                bnb_4bit_compute_dtype=torch.float16,
+                bnb_4bit_quant_type="nf4",
+                bnb_4bit_use_double_quant=True,
+            )
+            load_kwargs['device_map'] = 'auto'
+        except ImportError:
+            raise ImportError(
+                "4-bit loading requires bitsandbytes. "
+                "Install with: pip install bitsandbytes"
+            )
+    elif load_in_8bit:
+        print("  Loading in 8-bit quantization...")
+        load_kwargs['load_in_8bit'] = True
+        load_kwargs['device_map'] = 'auto'
+    else:
+        load_kwargs['torch_dtype'] = torch.float32
+    
+    model = AutoModelForCausalLM.from_pretrained(model_name, **load_kwargs)
+    
+    # Move to device if not using quantization (quantized models use device_map)
+    if not (load_in_4bit or load_in_8bit):
+        model = model.to(device)
     
     model.eval()
     
     # Count parameters
     total_params = sum(p.numel() for p in model.parameters())
     print(f"Total parameters: {total_params:,}")
+    
+    if load_in_4bit:
+        print("  Model loaded in 4-bit NF4 quantization")
+    elif load_in_8bit:
+        print("  Model loaded in 8-bit quantization")
     
     return model, tokenizer
 
@@ -153,8 +199,22 @@ def main():
     
     print(f"Using device: {device}")
     
+    # Check for conflicting options
+    if args.load_in_4bit and args.load_in_8bit:
+        print("Error: Cannot use both --load-in-4bit and --load-in-8bit")
+        return
+    
     # Load model
-    model, tokenizer = load_model_and_tokenizer(args.model, device)
+    model, tokenizer = load_model_and_tokenizer(
+        args.model, device, 
+        load_in_4bit=args.load_in_4bit,
+        load_in_8bit=args.load_in_8bit
+    )
+    
+    # Update device for quantized models
+    if args.load_in_4bit or args.load_in_8bit:
+        device = next(model.parameters()).device
+        print(f"Model loaded on: {device}")
     
     # Diagnose model structure
     print("\n" + "=" * 60)
