@@ -6,14 +6,81 @@ Implements output-aligned non-orthogonal projections as described in:
 
 The key insight: SVD gives orthogonal bases that don't align with task-specific
 outputs. Instead, we learn a non-orthogonal adapter A that minimizes ||Y - WXA||²
+
+Supports:
+- Standard float16/float32 models
+- 4-bit quantized models (bitsandbytes)
+- 8-bit quantized models (bitsandbytes)
 """
 
 import torch
 import torch.nn as nn
 import torch.optim as optim
-from typing import Tuple, Optional, List
+from typing import Tuple, Optional, List, Union
 from dataclasses import dataclass
 import math
+
+
+def dequantize_weight(module: nn.Module) -> torch.Tensor:
+    """
+    Extract dequantized weights from a module.
+    
+    Handles:
+    - Standard nn.Linear
+    - bitsandbytes Linear4bit
+    - bitsandbytes Linear8bitLt
+    
+    Returns:
+        Float32 weight tensor [out_features, in_features]
+    """
+    # Check for bitsandbytes 4-bit
+    if hasattr(module, 'weight') and hasattr(module.weight, 'quant_state'):
+        try:
+            import bitsandbytes as bnb
+            # 4-bit: dequantize using bitsandbytes
+            return bnb.functional.dequantize_4bit(
+                module.weight.data,
+                module.weight.quant_state
+            ).float()
+        except ImportError:
+            raise ImportError("bitsandbytes required for 4-bit model support")
+    
+    # Check for bitsandbytes 8-bit
+    if type(module).__name__ == 'Linear8bitLt':
+        try:
+            import bitsandbytes as bnb
+            # 8-bit: use the CB and SCB tensors
+            if hasattr(module, 'weight') and hasattr(module.weight, 'CB'):
+                return (module.weight.CB.float() * module.weight.SCB.float().unsqueeze(1))
+        except ImportError:
+            raise ImportError("bitsandbytes required for 8-bit model support")
+    
+    # Standard module - just return the weight
+    if hasattr(module, 'weight'):
+        return module.weight.data.float()
+    
+    raise ValueError(f"Cannot extract weight from {type(module)}")
+
+
+def is_quantized_module(module: nn.Module) -> bool:
+    """Check if a module is quantized (4-bit or 8-bit)."""
+    # Check for 4-bit
+    if hasattr(module, 'weight') and hasattr(module.weight, 'quant_state'):
+        return True
+    # Check for 8-bit
+    if type(module).__name__ in ['Linear8bitLt', 'Linear4bit']:
+        return True
+    return False
+
+
+def get_module_dtype(module: nn.Module) -> torch.dtype:
+    """Get the compute dtype for a module."""
+    if hasattr(module, 'compute_dtype'):
+        return module.compute_dtype
+    if hasattr(module, 'weight'):
+        if hasattr(module.weight, 'dtype'):
+            return module.weight.dtype
+    return torch.float32
 
 
 @dataclass
@@ -68,25 +135,33 @@ class MatrixPruner:
     1. Collect activations X from calibration data
     2. Train adapter A to minimize ||WX - W'A^TX|| where W' = WA
     3. Replace W with factorized form (W', A^T)
+    
+    Supports both standard and quantized (4-bit/8-bit) modules.
     """
     
     def __init__(
         self,
-        weight: torch.Tensor,
+        weight_or_module: Union[torch.Tensor, nn.Module],
         pruning_factor: float,
         config: Optional[PruningConfig] = None
     ):
         """
         Args:
-            weight: Original weight matrix [H, D]
+            weight_or_module: Original weight matrix [H, D] or nn.Module
             pruning_factor: Target compression (0.5 = keep 50% of params)
             config: Training configuration
         """
         self.config = config or PruningConfig()
         self.device = self.config.device
         
-        # Store original weight
-        self.W = weight.to(self.device).float()
+        # Extract weight - handles quantized models
+        if isinstance(weight_or_module, nn.Module):
+            self.W = dequantize_weight(weight_or_module).to(self.device)
+            self.is_quantized = is_quantized_module(weight_or_module)
+        else:
+            self.W = weight_or_module.to(self.device).float()
+            self.is_quantized = False
+        
         self.H, self.D = self.W.shape
         
         # Compute target rank from pruning factor
