@@ -36,8 +36,10 @@ def parse_args():
     parser.add_argument("--model", type=str, default="gpt2",
                        help="HuggingFace model name")
     parser.add_argument("--strategy", type=str, default="uniform",
-                       choices=["uniform", "adaptive"],
-                       help="Pruning strategy")
+                       choices=["uniform", "adaptive", "simple"],
+                       help="Pruning strategy (simple recommended for large models)")
+    parser.add_argument("--factor", type=float, default=0.5,
+                       help="Pruning factor for simple strategy (0.5 = 50%% compression)")
     parser.add_argument("--samples", type=int, default=100,
                        help="Number of calibration samples")
     parser.add_argument("--eval-samples", type=int, default=50,
@@ -275,11 +277,18 @@ def main():
     print(f"RUNNING {args.strategy.upper()} PRUNING")
     print(f"{'=' * 60}")
     
-    if args.strategy == "uniform":
+    if args.strategy == "simple":
+        # Simple mode: just apply a fixed factor, most memory efficient
+        factors = pruner.simple_prune(
+            calibration_loader,
+            pruning_factor=args.factor,
+        )
+    elif args.strategy == "uniform":
         factors = pruner.uniform_prune(
             calibration_loader,
             eval_fn,
             baseline_accuracy,
+            memory_efficient=True,  # Use memory-efficient mode by default
         )
     else:
         factors = pruner.adaptive_prune(
