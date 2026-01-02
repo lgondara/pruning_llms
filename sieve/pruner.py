@@ -131,12 +131,8 @@ class TransformerPruner:
         """
         Collect activations from calibration data.
         
-        Args:
-            dataloader: Iterable yielding input tensors
-            max_tokens: Maximum tokens to collect (default: config.calibration_tokens)
-        
-        Returns:
-            Dict mapping layer names to activation tensors
+        NOTE: This method is kept for backward compatibility but is memory-intensive.
+        For large models, use calibrate_memory_efficient() instead.
         """
         max_tokens = max_tokens or self.config.calibration_tokens
         collector = ActivationCollector()
@@ -185,6 +181,122 @@ class TransformerPruner:
         
         return activations
     
+    def _collect_single_layer_activations(
+        self,
+        layer_name: str,
+        dataloader,
+        max_tokens: int
+    ) -> torch.Tensor:
+        """
+        Collect activations for a single layer only.
+        
+        Memory-efficient: only stores activations for one layer at a time.
+        """
+        layer_info = self.prunable_layers[layer_name]
+        activations = []
+        
+        def hook(module, input, output):
+            x = input[0].detach()
+            if x.dim() == 3:
+                x = x.reshape(-1, x.size(-1))
+            # Store as float16 to save memory
+            activations.append(x.half().cpu())
+        
+        handle = layer_info.module.register_forward_hook(hook)
+        
+        self.model.eval()
+        total_tokens = 0
+        
+        try:
+            with torch.no_grad():
+                for batch in dataloader:
+                    if isinstance(batch, dict):
+                        inputs = {k: v.to(self.device) for k, v in batch.items() 
+                                 if isinstance(v, torch.Tensor)}
+                        self.model(**inputs)
+                        n_tokens = batch.get('input_ids', batch.get('inputs')).numel()
+                    elif isinstance(batch, torch.Tensor):
+                        self.model(batch.to(self.device))
+                        n_tokens = batch.numel()
+                    else:
+                        input_ids = batch[0].to(self.device)
+                        self.model(input_ids)
+                        n_tokens = input_ids.numel()
+                    
+                    total_tokens += n_tokens
+                    if total_tokens >= max_tokens:
+                        break
+        finally:
+            handle.remove()
+        
+        # Concatenate and convert back to float32 for calibration
+        return torch.cat(activations, dim=0).float()
+    
+    def calibrate_memory_efficient(
+        self,
+        dataloader,
+        pruning_factors: Dict[str, float],
+        max_tokens: Optional[int] = None
+    ):
+        """
+        Memory-efficient calibration: process one layer at a time.
+        
+        This is the recommended method for large models (7B+).
+        Instead of storing all activations, we:
+        1. For each layer, collect its activations
+        2. Calibrate that layer's pruner
+        3. Free the activations before moving to next layer
+        
+        Args:
+            dataloader: Calibration data (will be iterated multiple times)
+            pruning_factors: Dict mapping layer name to pruning factor
+            max_tokens: Max tokens per layer (default: config.calibration_tokens)
+        """
+        max_tokens = max_tokens or self.config.calibration_tokens
+        self.pruning_factors = pruning_factors
+        
+        pruning_config = PruningConfig(
+            learning_rate=self.config.learning_rate,
+            num_epochs=self.config.num_epochs,
+            batch_size=self.config.batch_size,
+            device=self.device
+        )
+        
+        layer_names = list(self.prunable_layers.keys())
+        print(f"\nMemory-efficient calibration: {len(layer_names)} layers")
+        print(f"Processing one layer at a time to minimize memory usage\n")
+        
+        for i, name in enumerate(layer_names):
+            info = self.prunable_layers[name]
+            factor = pruning_factors.get(name, 0.5)
+            
+            print(f"[{i+1}/{len(layer_names)}] {name}")
+            print(f"  Collecting activations...", end=" ", flush=True)
+            
+            # Collect activations for this layer only
+            activations = self._collect_single_layer_activations(
+                name, dataloader, max_tokens
+            )
+            print(f"{activations.shape[0]:,} tokens")
+            
+            # Create and calibrate pruner
+            print(f"  Calibrating (factor={factor:.2f})...", end=" ", flush=True)
+            pruner = MatrixPruner(
+                weight_or_module=info.module,
+                pruning_factor=factor,
+                config=pruning_config
+            )
+            pruner.calibrate(activations)
+            self.pruners[name] = pruner
+            print("done")
+            
+            # Free memory
+            del activations
+            torch.cuda.empty_cache() if torch.cuda.is_available() else None
+        
+        self.calibrated = True
+        print(f"\nCalibration complete: {len(self.pruners)} layers")
+    
     def calibrate_pruners(
         self,
         activations: Dict[str, torch.Tensor],
@@ -196,6 +308,8 @@ class TransformerPruner:
         Args:
             activations: Layer activations from collect_activations()
             pruning_factors: Dict mapping layer name to pruning factor
+        
+        Handles both standard and quantized (4-bit/8-bit) models.
         """
         self.pruning_factors = pruning_factors
         
@@ -208,6 +322,12 @@ class TransformerPruner:
         
         print("Calibrating pruners for each layer...")
         
+        # Check if any layers are quantized
+        n_quantized = sum(1 for info in self.prunable_layers.values() if info.is_quantized)
+        if n_quantized > 0:
+            print(f"  Note: {n_quantized} layers are quantized (4-bit/8-bit)")
+            print("  Dequantizing weights for calibration...")
+        
         for name, info in tqdm(self.prunable_layers.items(), desc="Calibrating"):
             if name not in activations:
                 print(f"  Warning: No activations for {name}, skipping")
@@ -215,8 +335,9 @@ class TransformerPruner:
             
             factor = pruning_factors.get(name, 0.5)  # Default 50% compression
             
+            # Pass the module directly - MatrixPruner handles dequantization
             pruner = MatrixPruner(
-                weight=info.module.weight.data,
+                weight_or_module=info.module,
                 pruning_factor=factor,
                 config=pruning_config
             )
@@ -227,12 +348,47 @@ class TransformerPruner:
         self.calibrated = True
         print(f"Calibrated {len(self.pruners)} pruners")
     
+    def simple_prune(
+        self,
+        dataloader,
+        pruning_factor: float = 0.5,
+        max_tokens: Optional[int] = None
+    ) -> Dict[str, float]:
+        """
+        Simple single-pass pruning with a fixed factor.
+        
+        Use this when you know what pruning factor you want, or for
+        memory-constrained situations where you can't afford multiple
+        evaluation passes.
+        
+        Args:
+            dataloader: Calibration data
+            pruning_factor: Compression factor (0.5 = keep 50% of params)
+            max_tokens: Max tokens for calibration
+        
+        Returns:
+            Dict of pruning factors (same factor for all layers)
+        """
+        print(f"\n{'=' * 50}")
+        print(f"SIMPLE PRUNING")
+        print(f"Pruning factor: {pruning_factor} ({1-pruning_factor:.0%} compression)")
+        print(f"{'=' * 50}\n")
+        
+        # Create uniform factors
+        uniform_factors = {name: pruning_factor for name in self.prunable_layers}
+        
+        # Calibrate (memory efficient)
+        self.calibrate_memory_efficient(dataloader, uniform_factors, max_tokens)
+        
+        return uniform_factors
+
     def uniform_prune(
         self,
         dataloader,
         eval_fn: Callable[[nn.Module], float],
         baseline_accuracy: float,
-        max_tokens: Optional[int] = None
+        max_tokens: Optional[int] = None,
+        memory_efficient: bool = True
     ) -> Dict[str, float]:
         """
         Find optimal uniform pruning factor via binary search.
@@ -242,6 +398,7 @@ class TransformerPruner:
             eval_fn: Function that evaluates model and returns accuracy
             baseline_accuracy: Original model accuracy
             max_tokens: Max tokens for calibration
+            memory_efficient: Use memory-efficient mode (recommended for 7B+ models)
         
         Returns:
             Dict of pruning factors (same factor for all layers)
@@ -252,10 +409,8 @@ class TransformerPruner:
         print(f"UNIFORM PRUNING")
         print(f"Baseline: {baseline_accuracy:.4f}")
         print(f"Threshold: {threshold:.4f} ({self.config.target_accuracy_drop:.0%} drop)")
+        print(f"Memory efficient: {memory_efficient}")
         print(f"{'=' * 50}\n")
-        
-        # Collect activations once
-        activations = self.collect_activations(dataloader, max_tokens)
         
         # Try each pruning factor
         best_factor = 1.0  # No pruning
@@ -267,7 +422,13 @@ class TransformerPruner:
             uniform_factors = {name: factor for name in self.prunable_layers}
             
             # Calibrate with this factor
-            self.calibrate_pruners(activations, uniform_factors)
+            if memory_efficient:
+                self.calibrate_memory_efficient(dataloader, uniform_factors, max_tokens)
+            else:
+                activations = self.collect_activations(dataloader, max_tokens)
+                self.calibrate_pruners(activations, uniform_factors)
+                del activations
+                torch.cuda.empty_cache() if torch.cuda.is_available() else None
             
             # Apply pruning to a copy
             test_model = copy.deepcopy(self.model)
@@ -293,7 +454,12 @@ class TransformerPruner:
         # Final calibration with best factor
         print(f"\nBest pruning factor: {best_factor} ({1-best_factor:.1%} compression)")
         final_factors = {name: best_factor for name in self.prunable_layers}
-        self.calibrate_pruners(activations, final_factors)
+        
+        if memory_efficient:
+            self.calibrate_memory_efficient(dataloader, final_factors, max_tokens)
+        else:
+            activations = self.collect_activations(dataloader, max_tokens)
+            self.calibrate_pruners(activations, final_factors)
         
         return final_factors
     
