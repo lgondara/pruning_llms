@@ -19,18 +19,55 @@ from collections import defaultdict
 class LayerInfo:
     """Information about a discovered linear layer."""
     name: str
-    module: nn.Linear
+    module: nn.Module  # Can be Linear, Linear4bit, or Linear8bitLt
     parent_name: str
     layer_type: str  # 'attention', 'mlp', 'embedding', 'head', 'other'
     layer_index: Optional[int]  # Which transformer block (0, 1, 2, ...)
+    is_quantized: bool = False
     
     @property
     def shape(self) -> Tuple[int, int]:
-        return (self.module.out_features, self.module.in_features)
+        if hasattr(self.module, 'out_features'):
+            return (self.module.out_features, self.module.in_features)
+        # For quantized modules that might store shape differently
+        if hasattr(self.module, 'weight'):
+            w = self.module.weight
+            if hasattr(w, 'shape'):
+                return tuple(w.shape[:2])
+        return (0, 0)
     
     @property
     def num_params(self) -> int:
-        return self.module.weight.numel()
+        h, d = self.shape
+        return h * d
+
+
+def is_linear_layer(module: nn.Module) -> bool:
+    """Check if module is a linear layer (including quantized variants)."""
+    # Standard Linear
+    if isinstance(module, nn.Linear):
+        return True
+    
+    # bitsandbytes quantized
+    module_type = type(module).__name__
+    if module_type in ['Linear4bit', 'Linear8bitLt', 'LinearNF4', 'LinearFP4']:
+        return True
+    
+    # Check for common quantized module attributes
+    if hasattr(module, 'weight') and hasattr(module, 'in_features') and hasattr(module, 'out_features'):
+        return True
+    
+    return False
+
+
+def is_module_quantized(module: nn.Module) -> bool:
+    """Check if a linear module is quantized."""
+    module_type = type(module).__name__
+    if module_type in ['Linear4bit', 'Linear8bitLt', 'LinearNF4', 'LinearFP4']:
+        return True
+    if hasattr(module, 'weight') and hasattr(module.weight, 'quant_state'):
+        return True
+    return False
 
 
 class LayerDiscovery:
@@ -93,18 +130,19 @@ class LayerDiscovery:
         Recursively traverse model to find all Linear layers.
         
         This is more reliable than named_modules() for nested structures.
+        Handles both standard and quantized (4-bit/8-bit) linear layers.
         """
         for name, child in module.named_children():
             full_name = f"{prefix}.{name}" if prefix else name
             
-            if isinstance(child, nn.Linear):
+            if is_linear_layer(child):
                 layer_info = self._classify_layer(full_name, child)
                 self.layers[full_name] = layer_info
             else:
                 # Recursively search children
                 self._recursive_find(child, full_name)
     
-    def _classify_layer(self, name: str, module: nn.Linear) -> LayerInfo:
+    def _classify_layer(self, name: str, module: nn.Module) -> LayerInfo:
         """Classify a linear layer by its role in the model."""
         name_lower = name.lower()
         parts = name.split('.')
@@ -122,12 +160,16 @@ class LayerDiscovery:
         # Classify by layer type
         layer_type = self._get_layer_type(name_lower, parent_name.lower())
         
+        # Check if quantized
+        quantized = is_module_quantized(module)
+        
         return LayerInfo(
             name=name,
             module=module,
             parent_name=parent_name,
             layer_type=layer_type,
-            layer_index=layer_index
+            layer_index=layer_index,
+            is_quantized=quantized
         )
     
     def _get_layer_type(self, name: str, parent: str) -> str:
